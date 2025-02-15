@@ -11,25 +11,35 @@
 #     "requests",
 #     "markdown",
 #     "asyncio",
+#     "aiofiles"
 # ]
 # ///
 
-from fastapi import FastAPI, HTTPException, Query
+
 import httpx
-import os
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+import aiofiles
+import sqlite3
+import requests
 import json
-from dateutil.parser import parse
+import os
+import markdown
 import subprocess
+from PIL import Image
+import speech_recognition as sr
+from dateutil.parser import parse
 import glob
 import numpy as np
 import re
-import  sqlite3
 import asyncio
 import traceback
 import base64
 from pathlib import Path
 
+
+
+# Initialize FastAPI app and configure CORS
 app = FastAPI()
 origins = ["*"]
 app.add_middleware(
@@ -39,16 +49,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-AIPROXY_TOKEN = os.getenv("AIPROXY_TOKEN")
 EMBEDDING_URL = "https://aiproxy.sanand.workers.dev/openai/v1/embeddings"
+AIPROXY_TOKEN = os.getenv("AIPROXY_TOKEN")
+
 HEADERS = {
     "Authorization": f"Bearer {AIPROXY_TOKEN}",
     "Content-Type": "application/json",
 }
 BATCH_SIZE = 1000  # API batching to avoid timeouts
-
-A_functions = [
+functions_tools = [
     {
         "type": "function", # ---> A1
         "function": {
@@ -229,26 +238,26 @@ A_functions = [
         }
     },
     {
-    "type": "function",  # ---> A8
-    "function": {
-        "name": "extract_credit_card_number",
-        "description": "Extract a credit card number from an image and save it to an output file.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "image_path": {
-                    "type": "string",
-                    "description": "The path to the image file (e.g., /data/images/card.png)"
+        "type": "function",  # ---> A8
+        "function": {
+            "name": "extract_credit_card_number",
+            "description": "Extract a credit card number from an image and save it to an output file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "image_path": {
+                        "type": "string",
+                        "description": "The path to the image file (e.g., /data/images/card.png)"
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": "The path to the output file (e.g., /data/output/card_number.txt)"
+                    }
                 },
-                "output_path": {
-                    "type": "string",
-                    "description": "The path to the output file (e.g., /data/output/card_number.txt)"
-                }
-            },
-            "required": ["image_path", "output_path"],
-            "additionalProperties": False
-        },"strict": True
-    }
+                "required": ["image_path", "output_path"],
+                "additionalProperties": False
+            },"strict": True
+        }
     },
     {
         "type": "function", # ---> A9
@@ -299,10 +308,123 @@ A_functions = [
             },
             "strict": True
         }
+    },
+    {
+        "type": "function",  # ---> B2
+        "function": {
+            "name": "prevent_file_deletion",
+            "description": "Data is never deleted anywhere on the file system, even if the task description asks for it",
+        }
     }
+    ,
+    {
+        "type": "function",# ---> B4
+        "function": {
+            "name": "clone_and_commit", 
+            "description": "Clone a Git repository, create a new file, commit the changes, and push them to the repository",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo_url": {"type": "string", "description": "The URL of the Git repository to clone"},
+                    "commit_message": {"type": "string", "description": "The commit message for the changes"},
+                    "file_name": {"type": "string", "description": "The name of the new file to create in the repository"},
+                    "file_content": {"type": "string", "description": "The content to write into the new file"}
+                },
+                "required": ["repo_url", "commit_message", "file_name", "file_content"],
+                "additionalProperties": False
+            },
+            "strict": True
+        }
+    },
+    {
+        "type": "function", #  ---> B3
+        "function": {
+            "name": "fetch_data_from_api",
+            "description": "Fetch data from an API and save it to a specified path",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "api_url": {"type": "string", "description": "The URL of the API to fetch data from"},
+                    "save_path": {"type": "string", "description": "The path to save the fetched data (e.g., /data/data.json)"}
+                },
+                "required": ["api_url", "save_path"],
+                "additionalProperties": False
+            },
+            "strict": True
+        }
+    },
+    {
+        "type": "function", #  ---> B5
+        "function": {
+            "name": "run_sql_query",
+            "description": "Run an SQL query on a specified SQLite database",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "database_path": {"type": "string", "description": "The path to the SQLite database file"},
+                    "query": {"type": "string", "description": "The SQL query to be executed"}
+                },
+                "required": ["database_path", "query"],
+                "additionalProperties": False
+            },
+            "strict": True
+        }
+    },
+    {
+        "type": "function", #  ---> B7
+        "function": {
+            "name": "resize_image",
+            "description": "Resize an image and save it to a specified output path",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "image_path": {"type": "string", "description": "The path to the input image file"},
+                    "output_path": {"type": "string", "description": "The path to save the resized image (e.g., /data/resized_image.jpg)"},
+                    "width": {"type": "integer", "description": "The width of the resized image in pixels"},
+                    "height": {"type": "integer", "description": "The height of the resized image in pixels"}
+                },
+                "required": ["image_path", "output_path", "width", "height"],
+                "additionalProperties": False
+            },
+            "strict": True
+        }
+    },
+    {
+        "type": "function",  #  ---> B8
+        "function": {
+            "name": "transcribe_audio",
+            "description": "Transcribe audio from an MP3 file to text and save it to a specified output path",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "inputfile": {"type": "string", "description": "The path or URL of the input MP3 file"},
+                    "outputfile": {"type": "string", "description": "The path to save the transcribed text (e.g., /data/transcription.txt)"}
+                },
+                "required": ["inputfile", "outputfile"],
+                "additionalProperties": False
+            },
+            "strict": True
+        }
+    },
+    {
+        "type": "function",# ---> B9
+        "function": {
+            "name": "convert_markdown_to_html", 
+            "description": "Convert a Markdown file to HTML and save it to a specified output path",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input_loc": {"type": "string", "description": "The path to the input Markdown file"},
+                    "output_loc": {"type": "string", "description": "The path to save the converted HTML file"}
+                },
+                "required": ["input_loc", "output_loc"],
+                "additionalProperties": False
+            },
+            "strict": True
+        }
+    } 
 ]
-
-# -----------------------------     Main function for (A1 code)     -----------------------------
+#  Main function for (A1 code)     -----------------------------
 async def script_runner(script_url, email_list):
     if isinstance(email_list, str):
         email_list = [email_list]  # Convert single email to a list
@@ -314,7 +436,7 @@ async def script_runner(script_url, email_list):
 
     return f"Command executed successfully in {current_dir}"
 
-# -----------------------------     Main function for (A2 code)     -----------------------------
+#  Main function for (A2 code)     -----------------------------
 def format_file_with_prettier(file_path: str, prettier_version: str):
     input_file_path = file_path    
     # Verify if the file exists
@@ -332,7 +454,7 @@ def format_file_with_prettier(file_path: str, prettier_version: str):
     except FileNotFoundError as e:
         print(f"File or executable not found: {e}")
 
-# -----------------------------     Main function for (A3 code)     -----------------------------
+#  Main function for (A3 code)     -----------------------------
 async def count_weekdays(input_file: str, output_file: str, weekday: str):
     weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     if weekday not in weekdays:
@@ -362,7 +484,7 @@ async def count_weekdays(input_file: str, output_file: str, weekday: str):
         return f"Error writing to output file: {e}"
     return f'File has been written in {output_file} ({wrote}) and Number of {weekday}s: {count}'
 
-# -----------------------------     Main function for (A4 code)     -----------------------------
+#  Main function for (A4 code)     -----------------------------
 async def sort_contacts(input_file_loc,output_file_loc,first_sort="last", second_sort="first"):
     input_file_loc = input_file_loc
     output_file_loc = output_file_loc
@@ -377,7 +499,7 @@ async def sort_contacts(input_file_loc,output_file_loc,first_sort="last", second
         json.dump(sorted_contacts, file, indent=4)
     return(f"Contacts sorted are written to this file loc {output_file_loc}")
 
-# -----------------------------     Main function for (A5 code)     -----------------------------
+# Main function for (A5 code)     -----------------------------
 def write_recent_logs(input_file,output_file,no_of_log=10, which_line=1):
     input_file_loc = input_file
     output_file_loc = output_file
@@ -394,7 +516,7 @@ def write_recent_logs(input_file,output_file,no_of_log=10, which_line=1):
                     output_file.write(lines[which_line - 1] + '\n')
     return f"The {no_of_log} log are written in this loc {output_file_loc}"
 
-# -----------------------------     Main function for (A6 code)     -----------------------------
+# Main function for (A6 code)     -----------------------------
 def create_index(input_dir, output_file):
     index = {}
     for root, _, files in os.walk(input_dir):
@@ -414,7 +536,7 @@ def create_index(input_dir, output_file):
     
     return f"The file has been successfully created at {output_file}"
 
-# -----------------------------     Main function for (A7 code)     -----------------------------
+# Main function for (A7 code)     -----------------------------
 async def extract_email_from_content(email_content: str):
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -431,7 +553,7 @@ async def extract_email_from_content(email_content: str):
     match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', content)# Use regex to extract a valid email address
     return match.group(0) if match else ""
 
-# -----------------------------     Main function for (A8 code)     -----------------------------
+# Main function for (A8 code)     -----------------------------
 async def extract_credit_card_number(image_path: str, output_path: str):
     try:
         image_path = Path(image_path)  
@@ -460,8 +582,6 @@ async def extract_credit_card_number(image_path: str, output_path: str):
             )
 
             response_data = response.json()
-            print("API Response:", json.dumps(response_data, indent=4))  # Debugging output
-
             card_number = (
                 response_data.get("choices", [{}])[0]
                 .get("message", {}).get("content", "")
@@ -488,7 +608,6 @@ async def load_comments(file_path):
     """Load comments from file asynchronously."""
     with open(file_path, "r", encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip()]
-# -------- (A9 sub_codes)
 async def get_embeddings(comments):
     """Fetch embeddings in batches for efficiency."""
     embeddings = []
@@ -499,7 +618,6 @@ async def get_embeddings(comments):
             response.raise_for_status()
             embeddings.extend([item["embedding"] for item in response.json()["data"]])
     return np.array(embeddings)
-# -------- (A9 sub_codes)
 def find_most_similar_fast(comments, embeddings):
     """Find the most similar comments using vectorized cosine similarity."""
     similarity_matrix = np.dot(embeddings, embeddings.T) / (
@@ -508,7 +626,7 @@ def find_most_similar_fast(comments, embeddings):
     np.fill_diagonal(similarity_matrix, -1)  # Ignore self-similarity
     i, j = np.unravel_index(np.argmax(similarity_matrix), similarity_matrix.shape)
     return comments[i], comments[j]
-# -----------------------------    Main function for (A9 codes)   -----------------------------
+# Main function for (A9 codes)   -----------------------------
 async def comments_similarity_tool(comments_file, output_file):
     """Find and save the most similar comments asynchronously."""
     comments_file = comments_file
@@ -525,7 +643,7 @@ async def comments_similarity_tool(comments_file, output_file):
 
     return f"Most similar comments saved to {output_file}"
 
-# -----------------------------    Main function for (A10 codes)   -----------------------------
+#    Main function for (A10 codes)   -----------------------------
 def calculate_gold_ticket_sales(database_file_loc: str, output_file_loc: str):
 
     conn = sqlite3.connect(database_file_loc)
@@ -541,6 +659,97 @@ def calculate_gold_ticket_sales(database_file_loc: str, output_file_loc: str):
 
     return result
 
+#B3
+async def fetch_data_from_api(api_url: str, save_path: str):
+    if not await is_within_data_directory(save_path):
+        raise HTTPException(status_code=403, detail="Save path must be within /data directory.")
+    response = requests.get(api_url)
+    data = response.json()
+    async with aiofiles.open(save_path, 'w') as file:
+        await file.write(json.dumps(data))
+    return {"message": "Data fetched and saved successfully"}
+
+#B4
+def clone_and_commit(repo_url: str, commit_message: str, file_name: str, file_content: str):
+    try:
+        # Get the repo name from the URL
+        repo_name = repo_url.split('/')[-1].replace('.git', '')
+        
+        subprocess.run(['git', 'clone', repo_url])
+        os.chdir(repo_name)
+        with open(file_name, 'w') as file:
+            file.write(file_content)
+        
+        subprocess.run(['git', 'add', file_name])
+        subprocess.run(['git', 'commit', '-m', commit_message])
+        subprocess.run(['git', 'push'])
+        
+        return {"message": f"Changes committed and pushed to {repo_url}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+#B5
+async def run_sql_query(database_path: str, query: str):
+    if not await is_within_data_directory(database_path):
+        raise HTTPException(status_code=403, detail="Database path must be within /data directory.")
+    conn = sqlite3.connect(database_path)
+    cursor = conn.cursor()
+    cursor.execute(query)
+    results = cursor.fetchall()
+    conn.close()
+    return {"results": results}
+
+#B7
+async def resize_image(image_path: str, output_path: str, width: int, height: int):
+    if not await is_within_data_directory(image_path) or not await is_within_data_directory(output_path):
+        raise HTTPException(status_code=403, detail="Image paths must be within /data directory.")
+    image = Image.open(image_path)
+    image = image.resize((width, height))
+    image.save(output_path)
+    return {"message": "Image resized successfully"}
+
+#B8
+def transcribe_audio(inputfile, outputfile):
+    try:
+        # Check if the inputfile is a URL
+        if inputfile.startswith('http://') or inputfile.startswith('https://'):
+            response = requests.get(inputfile)
+            with open('temp_audio.mp3', 'wb') as f:
+                f.write(response.content)
+            inputfile = 'temp_audio.mp3'
+        
+        # Convert MP3 to WAV using ffmpeg
+        wav_file = 'temp_audio.wav'
+        subprocess.run(['ffmpeg', '-i', inputfile, wav_file])
+
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_file) as source:
+            audio_data = recognizer.record(source)
+        transcription = recognizer.recognize_google(audio_data)
+
+        with open(outputfile, 'w', encoding='utf-8') as file:
+            file.write(transcription)
+
+        os.remove(wav_file)
+        if 'temp_audio.mp3' in locals():
+            os.remove('temp_audio.mp3')
+
+        print(f"Transcription successful! Saved to {outputfile}")
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+#B9
+async def convert_markdown_to_html(input_loc: str, output_loc: str):
+    if not await is_within_data_directory(input_loc) or not await is_within_data_directory(output_loc):
+        raise HTTPException(status_code=403, detail="Paths must be within /data directory.")
+    async with aiofiles.open(input_loc, 'r') as file:
+        markdown_content = await file.read()
+    html_content = markdown.markdown(markdown_content)
+    async with aiofiles.open(output_loc, 'w') as file:
+        await file.write(html_content)
+    return {"message": "Markdown converted to HTML successfully"}
+
 # Chat GPT Query
 async def query_gpt(task: str):
     async with httpx.AsyncClient() as client:
@@ -554,7 +763,7 @@ async def query_gpt(task: str):
                     },
                     {"role": "user", "content": task}
                     ],
-                "tools": A_functions,
+                "tools": functions_tools,
                 "tool_choice": "auto",
             },
         )
@@ -563,10 +772,7 @@ async def query_gpt(task: str):
     
     if "choices" not in response_data or not response_data["choices"]:
         raise HTTPException(status_code=500, detail="Invalid response from OpenAI API (no choices).")
-    choice = response_data["choices"][0]["message"]
-    if "tool_calls" not in choice or not choice["tool_calls"]:
-        raise HTTPException(status_code=500, detail="Invalid response from OpenAI API (no tool_calls).")
-    
+        
     return response_data
 
 @app.get("/run")
@@ -575,84 +781,136 @@ async def task(task: str = Query(..., description="The task to perform")):
         result = await query_gpt(task)
         fun = result["choices"][0]["message"]["tool_calls"][0]["function"]
         arguments = json.loads(fun["arguments"])
-        if fun["name"] == "script_runner":#A1
-            script_url = arguments["script_url"]  
-            email = arguments["args"]
-            ans = await script_runner(script_url=script_url, email_list=email)
-            return ans
         
-        elif fun["name"] == "format_file_with_prettier":#A2
-            file_path = os.path.abspath(arguments["file_path"])
-            prettier_version = arguments["prettier_version"]
-            format_file_with_prettier(file_path, prettier_version)
-            return f"File formatted successfully {file_path}"
-        
-        elif fun["name"] == "count_weekdays":#A3
-            input_file_loc = os.path.abspath(arguments["input_file_loc"])
-            output_file_loc = os.path.abspath(arguments["output_file_loc"])
-            day = arguments["day"]
-            ans = await count_weekdays(input_file_loc, output_file_loc, day)
-            return ans
-        
-        elif fun["name"] == "sort_contacts":#A4
-            input_file_loc = os.path.abspath(arguments["input_file_loc"])
-            output_file_loc = os.path.abspath(arguments["output_file_loc"])
-            first_sort = arguments["first_sort"]
-            second_sort = arguments["second_sort"]
-            ans = await sort_contacts(input_file_loc, output_file_loc, first_sort, second_sort)
-            return {"result": ans}
-        
-        elif fun["name"] == "write_recent_logs":#A5
-            no_of_log = arguments["no_of_log"]
-            which_line = arguments["which_line"]
-            input_file_loc = os.path.abspath(arguments["input_file_loc"])
-            output_file_loc = os.path.abspath(arguments["output_file_loc"])
-            ans = write_recent_logs(input_file_loc, output_file_loc,no_of_log, which_line)
-            return {"result": ans}
-        
-        elif fun["name"] == "create_index":#A6
-            input_file_loc = os.path.abspath(arguments["input_file_loc"])
-            output_file_loc = os.path.abspath(arguments["output_file_loc"])
-            ans = create_index(input_dir=input_file_loc, output_file=output_file_loc)
-            return {"result": ans}
-        
-        elif fun["name"] == "extract_email_from_content":#A7
-            input_file = os.path.abspath(arguments["input_file_loc"])
-            output_file = os.path.abspath(arguments["output_file_loc"])
+        tool_call = result["choices"][0]["message"]["tool_calls"][0] if "tool_calls" in result["choices"][0]["message"] else None
+        function_name = tool_call["function"]["name"]
+        raw_arguments = tool_call["function"]["arguments"]
+        argument = json.loads(raw_arguments)  
+        if tool_call:
             
-            with open(input_file, "r", encoding="utf-8") as f:
-                email_content = f.read()
+            if fun["name"] == "script_runner":#A1
+                script_url = arguments["script_url"]  
+                email = arguments["args"]
+                ans = await script_runner(script_url=script_url, email_list=email)
+                return ans
             
-            sender_email = await extract_email_from_content(email_content)
+            elif fun["name"] == "format_file_with_prettier":#A2
+                file_path = os.path.abspath(arguments["file_path"])
+                prettier_version = arguments["prettier_version"]
+                format_file_with_prettier(file_path, prettier_version)
+                return f"File formatted successfully {file_path}"
             
-            if sender_email:
-                with open(output_file, "w", encoding="utf-8") as f:
-                    f.write(sender_email)
-                return {"result": sender_email,"loc":f"file has been saved in {output_file}"}
-            else:
-                return("No valid email address found.")
+            elif fun["name"] == "count_weekdays":#A3
+                input_file_loc = os.path.abspath(arguments["input_file_loc"])
+                output_file_loc = os.path.abspath(arguments["output_file_loc"])
+                day = arguments["day"]
+                ans = await count_weekdays(input_file_loc, output_file_loc, day)
+                return ans
             
-        elif fun["name"] == "extract_credit_card_number":  # A8
-            image_file_path = os.path.abspath(arguments["image_path"])
-            output_file_path = os.path.abspath(arguments["output_path"])
-            result = await extract_credit_card_number(image_file_path, output_file_path)
-            return result 
-         
-        elif fun["name"] == "comments_similarity_tool":#A9
-            comments_file = os.path.abspath(arguments["comments_file"])
-            output_file = os.path.abspath(arguments["output_file"])
-            ans = await comments_similarity_tool(comments_file,output_file)
-            return {"result": ans}
+            elif fun["name"] == "sort_contacts":#A4
+                input_file_loc = os.path.abspath(arguments["input_file_loc"])
+                output_file_loc = os.path.abspath(arguments["output_file_loc"])
+                first_sort = arguments["first_sort"]
+                second_sort = arguments["second_sort"]
+                ans = await sort_contacts(input_file_loc, output_file_loc, first_sort, second_sort)
+                return {"result": ans}
+            
+            elif fun["name"] == "write_recent_logs":#A5
+                no_of_log = arguments["no_of_log"]
+                which_line = arguments["which_line"]
+                input_file_loc = os.path.abspath(arguments["input_file_loc"])
+                output_file_loc = os.path.abspath(arguments["output_file_loc"])
+                ans = write_recent_logs(input_file_loc, output_file_loc,no_of_log, which_line)
+                return {"result": ans}
+            
+            elif fun["name"] == "create_index":#A6
+                input_file_loc = os.path.abspath(arguments["input_file_loc"])
+                output_file_loc = os.path.abspath(arguments["output_file_loc"])
+                ans = create_index(input_dir=input_file_loc, output_file=output_file_loc)
+                return {"result": ans}
+            
+            elif fun["name"] == "extract_email_from_content":#A7
+                input_file = os.path.abspath(arguments["input_file_loc"])
+                output_file = os.path.abspath(arguments["output_file_loc"])
+                
+                with open(input_file, "r", encoding="utf-8") as f:
+                    email_content = f.read()
+                
+                sender_email = await extract_email_from_content(email_content)
+                
+                if sender_email:
+                    with open(output_file, "w", encoding="utf-8") as f:
+                        f.write(sender_email)
+                    return {"result": sender_email,"loc":f"file has been saved in {output_file}"}
+                else:
+                    return("No valid email address found.")
+                
+            elif fun["name"] == "extract_credit_card_number":  # A8
+                image_file_path = os.path.abspath(arguments["image_path"])
+                output_file_path = os.path.abspath(arguments["output_path"])
+                result = await extract_credit_card_number(image_file_path, output_file_path)
+                return result 
+            
+            elif fun["name"] == "comments_similarity_tool":#A9
+                comments_file = os.path.abspath(arguments["comments_file"])
+                output_file = os.path.abspath(arguments["output_file"])
+                ans = await comments_similarity_tool(comments_file,output_file)
+                return {"result": ans}
+            
+            elif fun["name"] == "calculate_gold_ticket_sales":    #A10
+                database_file_loc = os.path.abspath(arguments["database_file_loc"])
+                output_file_loc = os.path.abspath(arguments["output_file_loc"])
+                calculate_gold_ticket_sales(database_file_loc, output_file_loc)
+                return f"File formatted successfully in {output_file_loc}"
         
-        elif fun["name"] == "calculate_gold_ticket_sales":    #A10
-            database_file_loc = os.path.abspath(arguments["database_file_loc"])
-            output_file_loc = os.path.abspath(arguments["output_file_loc"])
-            calculate_gold_ticket_sales(database_file_loc, output_file_loc)
-            return f"File formatted successfully in {output_file_loc}"
-        return "Not thing is running"
+            if function_name == "prevent_file_deletion":
+                raise HTTPException(status_code=403, detail="File deletion is not allowed.")
 
+            elif function_name == "convert_markdown_to_html":
+                input_file_loc = os.path.abspath(argument["input_loc"])
+                output_file_loc = os.path.abspath(argument["output_loc"])
+                return await convert_markdown_to_html(input_loc=input_file_loc,output_loc=output_file_loc )
+            
+            elif function_name == "clone_and_commit":
+                repo_url = argument["repo_url"]
+                commit_message=argument["commit_message"]
+                file_name= argument["file_name"]
+                file_content= argument["file_content"]
+                return clone_and_commit(repo_url=repo_url, commit_message=commit_message,file_name= file_name,file_content=file_content)
+            
+            elif function_name == "fetch_data_from_api":
+                apiurl=argument["api_url"]
+                savepath= os.path.abspath(argument["save_path"])
+                return await fetch_data_from_api(api_url=apiurl, save_path=savepath)
+            
+            elif function_name == "run_sql_query":
+                database_path= os.path.abspath(argument["database_path"])
+                query=argument["query"]
+                return await run_sql_query(database_path=database_path, query=query)
+            
+            elif function_name == "resize_image":
+                image_path= os.path.abspath(argument["image_path"])
+                output_path= os.path.abspath(argument["output_path"])
+                width=argument["width"]
+                height=argument["height"]
+                return await resize_image(image_path=image_path, output_path=output_path, width=width, height=height)
+            
+            elif function_name == "transcribe_audio":
+                inputfile= os.path.abspath(argument["inputfile"])
+                outputfile=  os.path.abspath(argument["outputfile"])
+                return transcribe_audio(inputfile=inputfile,outputfile= outputfile)
+            
+            else:
+                return {"message": "No matching function call."}
+        else:
+            return {"message": result["choices"][0]["message"]["content"]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+async def is_within_data_directory(file_path: str) -> bool:
+    data_directory = os.path.abspath("data")
+    file_path = os.path.abspath(file_path)
+    return os.path.commonpath([data_directory]) == os.path.commonpath([data_directory, file_path])
 
 @app.get("/read")
 async def read_file(path: str):
@@ -665,10 +923,7 @@ async def read_file(path: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error reading file: {str(e)}")
 
-@app.get("/")
-async def root():
-    return {"message": "Hello, World! from main_app.py"}
-    
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="127.0.0.1", port=8000)
